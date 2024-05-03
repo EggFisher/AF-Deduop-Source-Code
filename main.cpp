@@ -18,6 +18,7 @@
 #include <random>
 #include <queue>
 #include <math.h>
+#define PBC_DEBUG
 
 using namespace std;
 using namespace chrono;
@@ -29,25 +30,25 @@ struct node{
 
 const int popThresh = 7;    //流行度阈值
 const int saltsLen = 8;     //随机盐值长度8B
-const int fileBlockSize = 128;   //生成MHT时文件分块大小
-const int encryptFileBlockSize = 10000;  //进行双层加密时文件分块大小
+const int fileBlockSize = 1024 * 1024;   //生成MHT时文件分块大小
+const int encryptFileBlockSize = 256;  //进行双层加密时文件分块大小
 constexpr streamsize BUFFER_SIZE = 1024 * 1024;  // 1MB buffer size
 int treeLevel;
-const string filePath = "file32MB.bin";
+const string filePath = "file128MB.bin";
 string ivString = "0123456789012345"; // AES-CBC 需要 16 字节长的 IV
 
 pairing_t pairing;
 element_t g, h_F;
 element_t r, s, g1, pk;
 element_t tmp1, tmp2;
-element_t C1, C2, C3;
+element_t C1, C2, C3, C4, C5;
 element_t g_p, h, L;
 element_t d1, d2, Z, ZL;
-element_t hexCi_ele;
-mpz_t hexCi_mpz;
-string hexCi_dec, hexCi, fileContent, K1, fileTag, plaintext;
+string hexCiphertext, fileContent, K1, fileTag, plaintext;
 element_t q, q_inv, F_p, alpha_p, alpha;
 int nLeaves, nMHTs;
+vector<string> fileBlocks, saltsValue, rootNodeofADMHF, outerLayerCiphertext;
+vector<unsigned char> ciphertext;
 
 string readFileInChunks(const string &filePath);
 string calculateSHA1(const string& data);
@@ -67,15 +68,27 @@ int calculateNumBytes(int n);
 int generateRandomNumber(int n);
 vector<node> generateResponse(vector<string> fileBlocks, string salt, int challengeLeafNode);
 bool verifyResponse(vector<node> responseNodeSet, string salt, string realRootNode);
-void outerLayerEncrypt(string hexCiphertext);
-void outerLayerDecrypt();
+string hex_xor(const std::string& hex1, const std::string& hex2);
+std::string element_to_string(element_t element);
+void outerLayerEncrypt();
+string outerLayerDecrypt(string str);
 void keyGen();
 void blindSig();
+void initialUpload();
+void subsequentUpload();
+void dataDeduplication();
+void fileDownload();
 
 int main(){
     cout<<filePath<<endl;
 
-    //生成密钥 & 系统初始化
+    // 初始化pairing
+    char param[1024];
+    size_t count = fread(param, 1, 1024, stdin);
+    if(!count) pbc_die("input error!");
+    pairing_init_set_buf(pairing, param, count);
+
+    //生成密钥
     auto start = steady_clock::now();
     keyGen();
     auto end=steady_clock::now();
@@ -96,13 +109,13 @@ int main(){
 
     //文件加密
     start=steady_clock::now();
-    vector<unsigned char> ciphertext = aes_encrypt(fileContent, K1, ivString);
+    ciphertext = aes_encrypt(fileContent, K1, ivString);
     end=steady_clock::now();
     duration=duration_cast<milliseconds>(end-start);
     cout<<"Time cost for FileEncryption:"<<duration.count()<<"ms"<<endl;
 
     //生成文件标签 fileTag = H(ciphertext)
-    string hexCiphertext = toHexString(ciphertext); //16进制密文
+    hexCiphertext = toHexString(ciphertext); //16进制密文
 
     start=steady_clock::now();
     fileTag = sha256(hexCiphertext);
@@ -110,49 +123,23 @@ int main(){
     duration=duration_cast<milliseconds>(end-start);
     cout<<"Time cost for FileTagGen:"<<duration.count()<<"ms"<<endl;
 
-    //进行双层加密
-    vector<string> encryptFileBlocks = splitStringIntoBlocks(hexCiphertext, encryptFileBlockSize);
-
-    start=steady_clock::now();
-    for(int i=0;i<encryptFileBlocks.size();++i){
-        outerLayerEncrypt(encryptFileBlocks[i]);
-        // outerLayerDecrypt();
+    bool isInitialUser=1;
+    if(isInitialUser){
+        initialUpload();
+    }else{
+        subsequentUpload();
     }
-    end=steady_clock::now();
-    duration=duration_cast<milliseconds>(end-start);
-    cout<<"Time cost for OuterLayerEncryption:"<<duration.count()<<"ms"<<endl;
+    
+    return 0;
+}
 
-    //对密文进行分块
-    vector<string> fileBlocks = splitStringIntoBlocks(hexCiphertext, fileBlockSize);
-    nLeaves = fileBlocks.size();
-    // cout<<"叶子结点数目:"<<nLeaves<<endl;
-
-    //根据叶子节点的数目生成MHT的数量
-    nMHTs = calculateMHTNum(nLeaves);
-    // cout<<"MHT数目:"<<nMHTs<<endl;
-
-    //生成随机盐值 nMHTs个
-    vector<string> saltsValue = generateRandomSalts(nMHTs, saltsLen);
-
-    //生成 ADMHF (nMHTs个)
-    start=steady_clock::now();
-    vector<string> rootNodeofADMHF;
-    for( int i=0; i<nMHTs; ++i ){
-        rootNodeofADMHF.push_back(buildMerkleHashTree(fileBlocks, saltsValue[i]));
-    }
-    //cout<<"treeLevel:"<<treeLevel<<endl;
-    end=steady_clock::now();
-    duration=duration_cast<milliseconds>(end-start);
-    cout<<"Time cost for ADMHF Generation:"<<duration.count()<<"ms"<<endl;
-
-    //后续上传者进行PoW
+void subsequentUpload(){
     //Challenge
-    start=steady_clock::now();
+    auto start=steady_clock::now();
     int chalMHT=generateRandomNumber(nMHTs-1);
     int chalLeafNode=generateRandomNumber(nLeaves-1);
-    // cout<<"challenge MHT ID:"<<chalMHT<<' '<<"challenge Leaf Node:"<<chalLeafNode<<endl;
-    end=steady_clock::now();
-    duration=duration_cast<milliseconds>(end-start);
+    auto end=steady_clock::now();
+    auto duration=duration_cast<milliseconds>(end-start);
     cout<<"Time cost for Challenge:"<<duration.count()<<"ms"<<endl;
 
     //Response
@@ -170,10 +157,120 @@ int main(){
     cout<<"Time cost for Verify:"<<duration.count()<<"ms"<<endl;
 
     if(isPass) cout<<"用户通过了验证！"<<endl;
-    else cout<<"用户未通过验证!"<<endl;
-    return 0;
+    else{
+        cout<<"用户未通过验证!"<<endl;
+        exit(0);
+    } 
+
+    int cntF=7;
+    if(cntF==popThresh) dataDeduplication();
 }
 
+void fileDownload(){
+    int tagPop=0;
+
+    auto start=steady_clock::now();
+    if(tagPop==1){
+        //非流行数据，需要双层解密
+        for(auto ele:outerLayerCiphertext){
+            hexCiphertext+=outerLayerDecrypt(ele);
+        }
+    }
+
+    ciphertext=fromHexString(hexCiphertext);
+    aes_decrypt(ciphertext,K1,ivString);
+
+    auto end=steady_clock::now();
+    auto duration=duration_cast<milliseconds>(end-start);
+    cout<<"Time cost for FileDownload:"<<duration.count()<<"ms"<<endl;
+}
+
+void dataDeduplication(){
+    //对外层进行解密
+    for(auto ele:outerLayerCiphertext){
+        outerLayerDecrypt(ele);
+    }
+}
+
+void initialUpload(){
+    //进行双层加密
+    auto start=steady_clock::now();
+    outerLayerEncrypt();
+    string strC5=element_to_string(C5);
+
+    //密文
+    vector<string> encryptFileBlocks = splitStringIntoBlocks(hexCiphertext, encryptFileBlockSize);
+    for(auto ele:encryptFileBlocks){
+        string ciphertext=hex_xor(strC5,ele);
+        outerLayerCiphertext.push_back(ciphertext);
+    }
+
+    string strL=element_to_string(L);
+    string fileHashVal=sha256(fileContent);
+    string tao_F = hex_xor(strL,fileHashVal);   //加密密钥
+
+    auto end=steady_clock::now();
+    auto duration=duration_cast<milliseconds>(end-start);
+    cout<<"Time cost for OuterLayerEncryption:"<<duration.count()<<"ms"<<endl;
+
+    //构建ADMHF
+    fileBlocks = splitStringIntoBlocks(hexCiphertext, fileBlockSize);
+    nLeaves = fileBlocks.size();
+
+    nMHTs = calculateMHTNum(nLeaves);
+
+    saltsValue = generateRandomSalts(nMHTs, saltsLen);
+
+    //生成 ADMHF (nMHTs个)
+    start=steady_clock::now();
+    
+    for( int i=0; i<nMHTs; ++i ){
+        rootNodeofADMHF.push_back(buildMerkleHashTree(fileBlocks, saltsValue[i]));
+    }
+    end=steady_clock::now();
+    duration=duration_cast<milliseconds>(end-start);
+    cout<<"Time cost for ADMHF Generation:"<<duration.count()<<"ms"<<endl;
+}
+
+// 对两个十六进制字符串进行异或操作
+std::string hex_xor(const std::string& hex1, const std::string& hex2) {
+    // 确定结果的长度为两个输入字符串中较长的那个
+    size_t max_length = std::max(hex1.size(), hex2.size());
+    std::string result(max_length, '0');
+    
+    // 从后往前逐位进行异或操作
+    for (int i = max_length - 1; i >= 0; --i) {
+        char hex1_char = (i < hex1.size()) ? hex1[i] : '0';
+        char hex2_char = (i < hex2.size()) ? hex2[i] : '0';
+        
+        // 将十六进制字符转换为对应的整数值
+        int val1 = (hex1_char >= '0' && hex1_char <= '9') ? hex1_char - '0' : hex1_char - 'A' + 10;
+        int val2 = (hex2_char >= '0' && hex2_char <= '9') ? hex2_char - '0' : hex2_char - 'A' + 10;
+        
+        // 计算异或结果
+        int xor_result = val1 ^ val2;
+        
+        // 将整数值转换为对应的十六进制字符
+        char hex_result = (xor_result < 10) ? ('0' + xor_result) : ('A' + xor_result - 10);
+        
+        // 存储结果
+        result[i] = hex_result;
+    }
+    
+    return result;
+}
+
+std::string element_to_string(element_t element) {
+    char *buf;
+    size_t len = 1024 *1024; // 初始大小为1024，可以根据需要调整
+    buf = (char *)malloc(len);
+    element_snprint(buf, len, C5);
+    std::string str(buf);
+    free(buf);
+    return str;
+}
+
+//进行盲签名
 void blindSig(){    
     string hF = calculateSHA1(fileContent);             //计算文件短哈希
 
@@ -186,8 +283,8 @@ void blindSig(){
     element_init_G1(alpha_p, pairing);
     element_init_G1(alpha, pairing);
 
-    element_random(q);
-    element_invert(q_inv, q);
+    element_random(q);  //用户随机选择q
+    element_invert(q_inv, q);   //求q的逆元
 
     //F_p = h_F * q
     element_mul_zn(F_p, h_F, q);
@@ -209,14 +306,8 @@ void blindSig(){
     }
 }
 
+//用户和CSP生成公私钥
 void keyGen(){
-    // 初始化pairing
-    char param[1024];
-    size_t count = fread(param, 1, 1024, stdin);
-    if(!count) pbc_die("input error!");
-    pairing_init_set_buf(pairing, param, count);
-
-    
     element_init_G2(g, pairing);
     element_init_G2(g1, pairing);
     element_init_G2(pk, pairing);
@@ -230,43 +321,32 @@ void keyGen(){
     element_init_Zr(s, pairing);
     
     element_random(g);  //为G2的生成元g赋值
-
     element_random(r);  //生成CSP私钥
     element_pow_zn(g1, g, r);
 
-    element_random(s);  //用户
+    element_random(s);  //用户选取随机数s
     element_pow_zn(pk, g, s);   //用户公钥
 }
 
-
-void outerLayerDecrypt(){
+string outerLayerDecrypt(string ciphertext){
     //3个双线性映射的结果
-    element_t pair1, pair2, pair3, res1, res2, res;
+    element_t pair1, pair2, res1, res2, res;
 
     element_init_GT(pair1, pairing);
     element_init_GT(pair2, pairing);
-    element_init_GT(pair3, pairing);
     element_init_GT(res1, pairing);
     element_init_GT(res2, pairing);
     element_init_GT(res, pairing);
 
-    pairing_apply(pair1, C3, pk, pairing);
+    pairing_apply(pair1, d2, C1, pairing);
     pairing_apply(pair2, d1, C1, pairing);
-    element_div(res,ZL,pair2);
 
-    pairing_apply(pair3, d2, C1, pairing);
-
-    element_mul(res1, C2, pair1);
-    element_mul(res2, pair2, pair3);
-    element_div(res, res1, res2);
-    
-    element_to_mpz(hexCi_mpz, res);
-
-    valueToMessage(hexCi,hexCi_mpz);
-    // cout<<"解密外层加密:"<<hexCi<<endl;
+    element_mul(res1, pair1, pair2);
+    string strRes1=element_to_string(res1);
+    // cout<<"解密以后的值:"<<hex_xor(strRes1,ciphertext)<<endl;
 }
 
-void outerLayerEncrypt(string hexCiphertext){
+void outerLayerEncrypt(){
     //非流行文件进行双层加密
  
     element_init_G2(C1, pairing);
@@ -276,6 +356,8 @@ void outerLayerEncrypt(string hexCiphertext){
     element_init_G2(d1, pairing);
     element_init_G2(d2, pairing);
 
+    element_init_GT(C4, pairing);
+    element_init_GT(C5, pairing);
     element_init_GT(Z, pairing);
     element_init_GT(C2, pairing);
     element_init_GT(ZL, pairing);
@@ -289,18 +371,9 @@ void outerLayerEncrypt(string hexCiphertext){
     //计算 C1 = g^L
     element_pow_zn(C1, g, L);
 
-    //计算 C2 = hexCi_ele * Z^L   Z = e(g1,g_p)
+    //计算 C2 = Z^L   Z = e(g1,g_p)
     pairing_apply(Z, g1, g_p, pairing);
-    element_pow_zn(ZL, Z, L);
-
-    //将明文消息映射到群上
-    mpz_init(hexCi_mpz);
-    element_init_GT(hexCi_ele, pairing);
-    messageToValue((char *)hexCiphertext.c_str(), hexCi_mpz, hexCi_dec);
-    hexCi = "[" + hexCi_dec + ",0]";
-    element_set_str(hexCi_ele, hexCi.c_str(), 10);  //将字符串形式的数值赋值给椭圆曲线上的元素
-
-    element_mul(C2, hexCi_ele, ZL);
+    element_pow_zn(C2, Z, L);
 
     //计算 C3 = (g1 * h)^L
     element_pow2_zn(C3, g1, L, h, L);
@@ -310,6 +383,12 @@ void outerLayerEncrypt(string hexCiphertext){
 
     //计算 d2 = (g1 * h)^s
     element_pow2_zn(d2, g1, s, h, s);
+
+    //计算 C4 = e(C3, pk)
+    pairing_apply(C4, C3, pk, pairing);
+
+    //计算 C5 = c4*C2
+    element_mul(C5, C4, C2);
 }
 
 bool verifyResponse(vector<node> responseNodeSet, string salt, string realRootNode)

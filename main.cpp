@@ -18,6 +18,7 @@
 #include <random>
 #include <queue>
 #include <math.h>
+
 #define PBC_DEBUG
 
 using namespace std;
@@ -30,11 +31,11 @@ struct node{
 
 const int popThresh = 7;    //流行度阈值
 const int saltsLen = 8;     //随机盐值长度8B
-const int fileBlockSize = 1024 * 1024;   //生成MHT时文件分块大小
-const int encryptFileBlockSize = 256;  //进行双层加密时文件分块大小
+const int fileBlockSize = 1024;   //生成MHT时文件分块大小
+const int encryptFileBlockSize = 1024 * 16;  //进行双层加密时文件分块大小
 constexpr streamsize BUFFER_SIZE = 1024 * 1024;  // 1MB buffer size
 int treeLevel;
-const string filePath = "file128MB.bin";
+const string filePath = "file256MB.bin";
 string ivString = "0123456789012345"; // AES-CBC 需要 16 字节长的 IV
 
 pairing_t pairing;
@@ -68,8 +69,8 @@ int calculateNumBytes(int n);
 int generateRandomNumber(int n);
 vector<node> generateResponse(vector<string> fileBlocks, string salt, int challengeLeafNode);
 bool verifyResponse(vector<node> responseNodeSet, string salt, string realRootNode);
-string hex_xor(const std::string& hex1, const std::string& hex2);
-std::string element_to_string(element_t element);
+string hex_xor(const string& hex1, const string& hex2);
+string element_to_string(element_t element);
 void outerLayerEncrypt();
 string outerLayerDecrypt(string str);
 void keyGen();
@@ -104,19 +105,18 @@ int main(){
     duration = duration_cast<milliseconds>(end - start);
     cout<<"Time cost for BlindSignature:"<<duration.count()<<"ms"<<endl;
 
-    //计算加密密钥 K1 = H(alpha)
-    K1=sha256(alpha);
-
     //文件加密
-    start=steady_clock::now();
+    start=steady_clock::now();  //计算加密密钥 K1 = H(alpha)
+
+    K1=sha256(alpha);
     ciphertext = aes_encrypt(fileContent, K1, ivString);
+    hexCiphertext = toHexString(ciphertext); //16进制密文
+
     end=steady_clock::now();
     duration=duration_cast<milliseconds>(end-start);
     cout<<"Time cost for FileEncryption:"<<duration.count()<<"ms"<<endl;
 
     //生成文件标签 fileTag = H(ciphertext)
-    hexCiphertext = toHexString(ciphertext); //16进制密文
-
     start=steady_clock::now();
     fileTag = sha256(hexCiphertext);
     end=steady_clock::now();
@@ -233,10 +233,10 @@ void initialUpload(){
 }
 
 // 对两个十六进制字符串进行异或操作
-std::string hex_xor(const std::string& hex1, const std::string& hex2) {
+string hex_xor(const string& hex1, const string& hex2) {
     // 确定结果的长度为两个输入字符串中较长的那个
-    size_t max_length = std::max(hex1.size(), hex2.size());
-    std::string result(max_length, '0');
+    size_t max_length = max(hex1.size(), hex2.size());
+    string result(max_length, '0');
     
     // 从后往前逐位进行异或操作
     for (int i = max_length - 1; i >= 0; --i) {
@@ -260,12 +260,12 @@ std::string hex_xor(const std::string& hex1, const std::string& hex2) {
     return result;
 }
 
-std::string element_to_string(element_t element) {
+string element_to_string(element_t element) {
     char *buf;
     size_t len = 1024 *1024; // 初始大小为1024，可以根据需要调整
     buf = (char *)malloc(len);
     element_snprint(buf, len, C5);
-    std::string str(buf);
+    string str(buf);
     free(buf);
     return str;
 }
